@@ -196,7 +196,7 @@ def validate(handoff, rtol=1e-5):
     # ---- final M and counts -----------------------------------------------------
     rule = handoff["final_M_rule"]
     expected_m = select_final_m(history, rule["rule"], rule["tau"])
-    if sorted(handoff["final_M"]) != expected_m:
+    if sorted(handoff["final_M"]) != sorted(expected_m):
         err(f"final_M {sorted(handoff['final_M'])} != recomputed {expected_m} "
             f"for rule {rule['rule']} tau {rule['tau']}")
     if handoff["detection_counts"] != detection_counts(history):
@@ -210,8 +210,25 @@ def validate(handoff, rtol=1e-5):
         err("client_train_indices must have one entry per client")
     else:
         flat = [i for n in names for i in parts[n]]
-        if any(len(parts[n]) != config["samples_per_client"] for n in names):
-            err("a client partition has the wrong size")
+        partition_type = config.get("partition", "iid")
+        samples_per_client = config.get("samples_per_client")
+        
+        # 1. Total dataset / partition size check
+        expected_total = config.get("total_train_samples")
+        if expected_total is None:
+            expected_total = samples_per_client * n_clients if samples_per_client else NUM_TRAIN_IMAGES        
+        if len(flat) != expected_total:
+            err(f"total partitioned samples ({len(flat)}) != expected total ({expected_total})")
+
+        # 2. Per-client size checks based on partition rule
+        if partition_type == "iid":
+            if samples_per_client and any(len(parts[n]) != samples_per_client for n in names):
+                err("a client partition has the wrong size for IID mode")
+        elif partition_type == "dirichlet":
+            if any(len(parts[n]) == 0 for n in names):
+                err("a client partition has 0 samples under Dirichlet distribution")
+
+        # 3. Disjointness and range checks
         if len(set(flat)) != len(flat):
             err("client partitions overlap")
         if flat and (min(flat) < 0 or max(flat) >= NUM_TRAIN_IMAGES):
@@ -223,8 +240,8 @@ def validate(handoff, rtol=1e-5):
         err(f"kd split has {len(kd)} images, expected {config['kd_reference_size']}")
     if set(kd) & set(ev):
         err("KD and evaluation test splits overlap")
-    if len(kd) + len(ev) != NUM_TEST_IMAGES or len(set(kd) | set(ev)) != NUM_TEST_IMAGES:
-        err("KD + evaluation splits do not cover the test set exactly")
+    if set(kd) | set(ev) != set(range(NUM_TEST_IMAGES)):
+        err(f"KD + evaluation splits do not cover range [0, {NUM_TEST_IMAGES}) exactly")
 
     return {"errors": errors, "warnings": warnings, "notes": notes}
 

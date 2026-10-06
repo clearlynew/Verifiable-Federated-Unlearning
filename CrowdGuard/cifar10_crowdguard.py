@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, Subset
 from torchvision import datasets, transforms
 
 from CrowdGuardClientValidation import CrowdGuardClientValidation
@@ -48,6 +48,36 @@ STD_DEV = torch.tensor([0.2023, 0.1994, 0.2010])
 VOTE_FOR_BENIGN = 1
 VOTE_FOR_POISONED = 0
 LOG_INTERVAL = 10
+
+def partition_dirichlet(dataset, num_clients, alpha, num_classes=10, seed=10):
+    np.random.seed(seed)
+    labels = np.array(dataset.targets)
+    
+    client_indices = [[] for _ in range(num_clients)]
+    min_size = 0
+    
+    while min_size < 10:
+        client_indices = [[] for _ in range(num_clients)]
+        proportions = np.random.dirichlet(np.repeat(alpha, num_clients), num_classes)
+        
+        for c in range(num_classes):
+            idx_k = np.where(labels == c)[0]
+            np.random.shuffle(idx_k)
+            
+            proportions_c = proportions[c]
+            proportions_c = proportions_c / proportions_c.sum()
+            splits = (np.cumsum(proportions_c) * len(idx_k)).astype(int)[:-1]
+            
+            idx_k_split = np.split(idx_k, splits)
+            for i in range(num_clients):
+                client_indices[i].extend(idx_k_split[i])
+        
+        min_size = min(len(idx) for idx in client_indices)
+
+    for i in range(num_clients):
+        np.random.shuffle(client_indices[i])
+        
+    return [Subset(dataset, indices) for indices in client_indices]
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +519,7 @@ class FederatedFlow(FLSpec):
         print("#" * 60)
 
 
-def build_datasets(config):
+def build_datasetsIID(config):
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(MEAN.tolist(), STD_DEV.tolist()),
@@ -557,6 +587,57 @@ def build_datasets(config):
     }
     return client_loaders, clean_test_loader, data_info
 
+def build_datasetsDirichlet(config):
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(MEAN.tolist(), STD_DEV.tolist()),
+    ])
+    train_dataset = datasets.CIFAR10(root="./data", train=True, download=True,
+                                     transform=transform)
+    test_dataset = datasets.CIFAR10(root="./data", train=False, download=True,
+                                    transform=transform)
+
+    # Use Dirichlet Non-IID partitioning
+    client_subsets = partition_dirichlet(
+        dataset=train_dataset,
+        num_clients=config.num_clients,
+        alpha=config.dirichlet_alpha,
+        seed=config.seed,
+    )
+
+    client_loaders = {}
+    client_train_indices = {}
+    for client_id, subset in enumerate(client_subsets):
+        client_loaders[client_id] = DataLoader(
+            subset, batch_size=config.batch_size, shuffle=True
+        )
+        client_train_indices[client_id] = [int(i) for i in subset.indices]
+
+    # Test set split setup
+    test_x = torch.stack([item[0] for item in test_dataset])
+    test_y = torch.tensor([item[1] for item in test_dataset], dtype=torch.long)
+
+    kd_indices, eval_indices = split_test_indices(
+        test_y.numpy(), config.kd_reference_size, config.test_split_seed)
+
+    eval_count = min(1000, len(eval_indices))
+    diag = torch.tensor(eval_indices[:eval_count], dtype=torch.long)
+    clean_test_loader = DataLoader(
+        TensorDataset(test_x[diag], test_y[diag]),
+        batch_size=1000, shuffle=False
+    )
+
+    data_info = {
+        "train_partition": client_train_indices,
+        "test_split": {
+            "seed": config.test_split_seed,
+            "kd_reference_size": config.kd_reference_size,
+            "kd_indices": kd_indices,
+            "eval_indices": eval_indices,
+        },
+    }
+    return client_loaders, clean_test_loader, data_info
+
 
 def make_backdoor_test_loader(test_dataset, trigger, indices, batch_size=1000,
                               max_samples=1000):
@@ -586,6 +667,9 @@ def parse_args():
     parser.add_argument("--pmr", type=float, default=0.05)
     parser.add_argument("--poison_rate", type=float, default=0.10)
     parser.add_argument("--alpha", type=float, default=0.70)
+    parser.add_argument("--dirichlet_alpha", type=float, default=0.5, help="Dirichlet concentration parameter for non-IID split")
+    parser.add_argument(
+    "--partition",type=str,choices=["iid", "dirichlet"],default="iid",help="Dataset partitioning strategy: iid or dirichlet")
     parser.add_argument("--attack_start_round", type=int, default=1)
     parser.add_argument("--seed", type=int, default=10)
     parser.add_argument("--optimizer_type", type=str, default="SGD")
@@ -612,6 +696,8 @@ def main():
         pmr=args.pmr,
         poison_rate=args.poison_rate,
         alpha=args.alpha,
+        dirichlet_alpha=args.dirichlet_alpha,  # <--- Pass it directly here
+        partition=args.partition,
         attack_start_round=args.attack_start_round,
         seed=args.seed,
         output_dir=args.output_dir,
@@ -639,8 +725,7 @@ def main():
     collaborators = [Collaborator(name=name) for name in collaborator_names]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    client_loaders, clean_test_loader, data_info = build_datasets(config)
-
+    client_loaders, clean_test_loader, data_info = build_datasetsIID(config) if partition == "iid" else build_datasetsDirichlet(config)
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(MEAN.tolist(), STD_DEV.tolist()),
