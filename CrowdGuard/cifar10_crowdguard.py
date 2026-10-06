@@ -725,7 +725,7 @@ def main():
     collaborators = [Collaborator(name=name) for name in collaborator_names]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    client_loaders, clean_test_loader, data_info = build_datasetsIID(config) if partition == "iid" else build_datasetsDirichlet(config)
+    client_loaders, clean_test_loader, data_info = build_datasetsIID(config) if config.partition == "iid" else build_datasetsDirichlet(config)
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(MEAN.tolist(), STD_DEV.tolist()),

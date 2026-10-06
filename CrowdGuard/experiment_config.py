@@ -75,6 +75,10 @@ class ExperimentConfig:
             raise ValueError("final_m_tau must be in (0, 1]")
         if not 0 < self.kd_reference_size < 10000:
             raise ValueError("kd_reference_size must be between 1 and 9999")
+        if self.partition not in ("iid", "dirichlet"):
+            raise ValueError("partition must be 'iid' or 'dirichlet'")
+        if self.partition == "dirichlet" and self.dirichlet_alpha <= 0:
+            raise ValueError("dirichlet_alpha must be > 0")
 
     @property
     def num_malicious_clients(self) -> int:

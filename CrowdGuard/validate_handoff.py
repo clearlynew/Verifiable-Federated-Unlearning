@@ -215,8 +215,10 @@ def validate(handoff, rtol=1e-5):
         
         # 1. Total dataset / partition size check
         expected_total = config.get("total_train_samples")
-        if expected_total is None:
-            expected_total = samples_per_client * n_clients if samples_per_client else NUM_TRAIN_IMAGES        
+        if partition_type == "dirichlet":
+            expected_total = NUM_TRAIN_IMAGES      # the Dirichlet split uses every training image
+        else:
+            expected_total = samples_per_client * n_clients if samples_per_client else NUM_TRAIN_IMAGES
         if len(flat) != expected_total:
             err(f"total partitioned samples ({len(flat)}) != expected total ({expected_total})")
 
