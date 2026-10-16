@@ -1,74 +1,91 @@
-# BAERASER-inspired Trigger Recovery
+# BAERASER-Inspired Trigger Recovery
 
-This package contains the team's gradient-based trigger-recovery prototype for investigating backdoor behavior in image-classification models.
+This package implements a simplified, gradient-based trigger-recovery prototype for CIFAR-10 image-classification models. It searches candidate triggers, evaluates their attack success rates (ASR), and ranks the candidates. It does not perform unlearning.
 
-## Scope and Limitations
+## Requirements
 
-This is a **simplified BAERASER-inspired method**, not a faithful implementation of the original BAERASER MSA/MESA and mutual-information mechanisms.
+- Run commands from the repository root.
+- The shared model definition must be available at `model/model.py`.
+- CIFAR-10 must already be downloaded. `DATA_ROOT` must contain `cifar-10-batches-py/`.
+- Install dependencies from `baeraser/requirements.txt`.
 
-The implementation optimizes candidate triggers, evaluates their attack success rates (ASR), and ranks them using the configured evaluation criteria. High ASR indicates that a candidate can induce the target prediction; it does not, by itself, establish that the original trigger has been reconstructed.
+## 1. Train the test models
 
-This package currently focuses on trigger recovery and evaluation. Federated unlearning and verification are separate stages of the overall project.
+Use `baeraser/scripts/train_backdoor.py` to create controlled models for validating recovery. These are centralized test models, not federated or post-unlearning models.
 
-## Files
+Set `DATA_ROOT` to the directory containing `cifar-10-batches-py/`.
 
-- `recovery.py`: candidate optimization, trigger evaluation, ASR calculation, ranking, and optional clean-model baseline comparison.
-- `__init__.py`: package initialization and public Python interface.
-- `scripts/train_backdoor.py`: script for training a controlled backdoored model for experiments.
-- `../model/model.py`: shared model definition.
+**Backdoored model:**
 
-The model definition is maintained in the shared `model/` package. Do not duplicate it inside this package.
+```bash
+python baeraser/scripts/train_backdoor.py \
+  --data "$DATA_ROOT" \
+  --out /path/to/backdoored_model.pt \
+  --epochs 15 \
+  --poison-rate 0.10
+```
 
-## Dataset
+**Clean control model:**
 
-The `--data-root` path must contain the `cifar-10-batches-py/` directory.
+```bash
+python baeraser/scripts/train_backdoor.py \
+  --data "$DATA_ROOT" \
+  --out /path/to/clean_model.pt \
+  --epochs 15 \
+  --poison-rate 0.0
+```
 
-The recovery code uses the CIFAR-10 test split with `download=False`. The dataset must therefore already be available locally.
+The default trigger size is 6×6. Keep the training settings comparable between runs. The backdoored checkpoint includes trigger metadata for offline evaluation; do not provide that metadata to the recovery search.
 
-The training script uses CIFAR-10 to train a model with a controlled backdoor for experimental evaluation.
+## 2. Run recovery
 
-## Run Recovery
-
-Run commands from the repository root.
+Run from the repository root:
 
 ```bash
 python -m baeraser.recovery \
   --model /path/to/backdoored_model.pt \
-  --data-root /path/to/cifar-10-root \
+  --data-root "$DATA_ROOT" \
   --output /path/to/recovery_results
 ```
 
-To evaluate a model alongside a clean-model baseline:
+To compare the backdoored model with the clean control:
 
 ```bash
 python -m baeraser.recovery \
-  --model /path/to/model_under_test.pt \
+  --model /path/to/backdoored_model.pt \
   --clean-model /path/to/clean_model.pt \
-  --data-root /path/to/cifar-10-root \
+  --data-root "$DATA_ROOT" \
   --output /path/to/recovery_results
 ```
 
-The model checkpoint must contain a compatible model state dictionary.
+The checkpoints must be compatible with the shared `LightweightResNet18` architecture.
+
+## 3. Run the validation test
+
+From the repository root:
+
+```bash
+python -m unittest -v baeraser.tests.test_recovery
+```
+
+The integration test trains or prepares controlled test models, runs recovery on both the backdoored model and the clean control, then compares the recovered result with the planted trigger's saved ground truth. It checks:
+
+- recovered target label and trigger position;
+- recovered-pattern similarity against the configured minimum;
+- backdoored-model maximum ASR against the configured threshold;
+- the ASR margin between the backdoored model and clean control; and
+- the expected verification classification.
+
+A passing test validates these checks for the controlled test case only. The full recovery search can take a substantial amount of time.
 
 ## Outputs
 
-The recovery script saves:
+Recovery writes results to the directory specified by `--output`. Depending on the options used, this includes JSON summaries and candidate metadata, top candidate triggers in a PyTorch file, the recovery configuration, and clean-baseline/verdict results when `--clean-model` is provided.
 
-- JSON summaries containing evaluation results.
-- Candidate metadata, including target labels, trigger positions, and evaluation metrics.
-- A PyTorch file containing the top candidate triggers in CIFAR-10 normalized input space.
-- Additional clean-baseline results when `--clean-model` is provided.
+## Limitations
 
-## Evaluation
+This is a simplified BAERASER-inspired method, not a faithful implementation of the original BAERASER MSA/MESA and mutual-information mechanisms. It does not implement BAERASER's gradient-ascent unlearning stage.
 
-The main evaluation metrics include:
+A high ASR does not by itself prove that the original trigger was reconstructed. A clean model may also produce a non-zero maximum ASR during candidate search, so compare results against the clean baseline. Failure to recover a trigger does not prove that a model is backdoor-free.
 
-- **Attack Success Rate (ASR):** the fraction of eligible evaluation images classified as the candidate's target label after applying the trigger.
-- **Clean Accuracy:** classification accuracy on unmodified evaluation images.
-- **Trigger ranking:** comparison of candidates using the implemented evaluation criteria.
-
-A clean-model comparison helps determine whether the recovered candidates behave differently on a model without the intended backdoor. Results should be interpreted cautiously: a candidate with high ASR is not necessarily visually or spatially identical to the original trigger.
-
-## Current Status
-
-This package is an experimental trigger-recovery component. Its results should not be described as verified unlearning or as a complete reproduction of the original BAERASER algorithm.
+The controlled experiment validates the recovery component, not successful federated unlearning or the complete verification pipeline. Test separately on actual post-unlearning models before making those claims.

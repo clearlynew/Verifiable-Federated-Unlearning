@@ -25,6 +25,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+import sys
 
 import numpy as np
 import torch
@@ -32,6 +33,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
+
+# Make the repository root importable when this file is executed directly as
+# ``python /path/to/baeraser/recovery.py``. In the project layout, ``model/``
+# is a sibling of the ``baeraser/`` package.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from model.model import LightweightResNet18
 
@@ -502,7 +510,11 @@ def recover_triggers(
 
     # For every candidate target label, optimize all locations.
     for target_label in range(config.num_classes):
-        print(f"\nTarget label {target_label}/{config.num_classes - 1}")
+        print(
+            f"\nTarget {target_label + 1}/{config.num_classes} | "
+            f"locations 0/{len(locations)}",
+            flush=True,
+        )
 
         for start_idx in range(0, len(locations), config.candidate_chunk_size):
             loc_chunk = locations[
@@ -545,10 +557,15 @@ def recover_triggers(
                 })
 
             done = min(start_idx + len(loc_chunk), len(locations))
-            print(
-                f"  locations {done:3d}/{len(locations)} | "
-                f"elapsed {(time.time()-start)/60:.1f} min"
-            )
+            # Keep notebook output readable: report every 4 chunks and at
+            # the end of each target label, rather than printing every chunk.
+            if done == len(locations) or done % (4 * config.candidate_chunk_size) == 0:
+                print(
+                    f"Target {target_label + 1}/{config.num_classes} | "
+                    f"locations {done}/{len(locations)} | "
+                    f"elapsed {(time.time()-start)/60:.1f} min",
+                    flush=True,
+                )
 
     all_results.sort(key=lambda r: r["asr"], reverse=True)
     return all_results
@@ -726,7 +743,8 @@ def main():
 
     seed_everything(args.seed)
     device = get_device()
-    print("Device:", device)
+    device_name = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
+    print(f"Device: {device.type.upper()} ({device_name})", flush=True)
 
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
@@ -750,8 +768,9 @@ def main():
         num_workers=config.num_workers,
     )
 
-    # Post-unlearning model θU
-    print("\n=== Recovering on post-unlearning model θU ===")
+    # Keep experiment-stage narration in the calling script; this CLI only
+    # reports device, algorithm progress, and results.
+    print("Recovery pass 1/2" if args.clean_model else "Recovery pass 1/1", flush=True)
     model_u = LightweightResNet18(num_classes=config.num_classes).to(device)
     load_checkpoint(model_u, args.model, device)
 
@@ -765,13 +784,13 @@ def main():
     with open(out / "post_unlearning_summary.json", "w") as f:
         json.dump(summary_u, f, indent=2)
 
-    print("\nPost-unlearning summary:")
+    print("\nModel-under-test recovery summary:")
     print(json.dumps(summary_u, indent=2))
     print(f"Recovery runtime: {(time.time()-t0)/60:.2f} min")
 
     # Clean baseline, if supplied.
     if args.clean_model:
-        print("\n=== Recovering on clean-model baseline ===")
+        print("\nRecovery pass 2/2", flush=True)
         clean = LightweightResNet18(num_classes=config.num_classes).to(device)
         load_checkpoint(clean, args.clean_model, device)
 
