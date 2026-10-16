@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.ipynb_checkpoints/
+
+data/
+datasets/
+*.pt
+*.pth
+*.ckpt
+
+*_results/
+recovery_results/
+clean_recovery_results/

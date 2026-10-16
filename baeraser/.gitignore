@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.ipynb_checkpoints/
+
+# Datasets
+data/
+datasets/
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Generated metadata and experimental results
+*_metadata.json
+*_results/
+recovery_results/
+clean_recovery_results/
