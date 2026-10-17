@@ -674,6 +674,33 @@ def save_results(results: List[Dict], path: str) -> None:
         json.dump(serializable, f, indent=2)
 
 
+def save_all_triggers(results: List[Dict], path: str) -> None:
+    """Save every candidate tensor and its metadata for offline evaluation.
+
+    For the default 7,290 candidates and 6x6 RGB triggers, the tensor payload
+    is small enough to retain as one file. Ground-truth comparisons remain in
+    the test harness and are not used by the recovery/verdict logic.
+    """
+    tensors = torch.stack([r["trigger"] for r in results], dim=0)
+    metadata = [{
+        "rank": rank,
+        "target_label": int(r["target_label"]),
+        "u": int(r["u"]),
+        "v": int(r["v"]),
+        "asr": float(r["asr"]),
+        "clean_accuracy": float(r["clean_accuracy"]),
+        "evaluated_samples": int(r["evaluated_samples"]),
+    } for rank, r in enumerate(results, start=1)]
+    torch.save({
+        "triggers": tensors,
+        "metadata": metadata,
+        "note": (
+            "All candidate triggers, sorted by verification ASR, in CIFAR-10 "
+            "normalized input space. Ground truth was not used during recovery."
+        ),
+    }, path)
+
+
 def save_top_triggers(results: List[Dict], path: str, top_n: int = 50) -> None:
     top = results[:top_n]
     tensors = torch.stack([r["trigger"] for r in top], dim=0)
@@ -780,6 +807,7 @@ def main():
 
     save_results(results_u, str(out / "post_unlearning_results.json"))
     save_top_triggers(results_u, str(out / "post_unlearning_top_triggers.pt"))
+    save_all_triggers(results_u, str(out / "post_unlearning_all_triggers.pt"))
 
     with open(out / "post_unlearning_summary.json", "w") as f:
         json.dump(summary_u, f, indent=2)
@@ -800,6 +828,7 @@ def main():
 
         save_results(results_clean, str(out / "clean_baseline_results.json"))
         save_top_triggers(results_clean, str(out / "clean_baseline_top_triggers.pt"))
+        save_all_triggers(results_clean, str(out / "clean_baseline_all_triggers.pt"))
 
         verdict = classify_verification(
             summary_u, summary_clean, config.delta_baseline
