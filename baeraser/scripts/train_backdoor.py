@@ -3,7 +3,7 @@
 
 The trigger is a randomized 6x6 RGB patch in raw [0,1] pixel space.
 Training is centralized only to create a controlled test checkpoint for the
-BAERASER-inspired recovery module; it is NOT federated training or unlearning.
+BAERASER-inspired recovery module; it is NOT federated training or Wu unlearning.
 """
 
 import argparse
@@ -11,7 +11,7 @@ import json
 import os
 import random
 import sys
-import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -19,7 +19,12 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import datasets, transforms
 
-from model.model import LightweightResNet18, count_parameters
+# Add the repository root to sys.path so ``import model`` works when run as a script.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from model import LightweightResNet18, count_parameters
 
 
 MEAN = torch.tensor((0.4914, 0.4822, 0.4465)).view(3, 1, 1)
@@ -38,34 +43,57 @@ def seed_all(seed):
 def make_trigger(seed, size=6):
     """Generate a reproducible RGB trigger and its location and target label."""
     generator = torch.Generator().manual_seed(seed)
+
     patch = torch.rand((3, size, size), generator=generator)
+
     py = random.Random(seed + 1).randint(0, 32 - size)
     px = random.Random(seed + 2).randint(0, 32 - size)
     target = random.Random(seed + 3).randint(0, 9)
+
     return patch, (py, px), target
 
 
 class PoisonedCIFAR(Dataset):
     """CIFAR-10 dataset with a fixed trigger applied to selected train images."""
 
-    def __init__(self, root, train, poison_rate, patch, position, target, seed=42):
+    def __init__(
+        self,
+        root,
+        train,
+        poison_rate,
+        patch,
+        position,
+        target,
+        seed=42,
+    ):
         self.ds = datasets.CIFAR10(
             root=root,
             train=train,
             download=False,
             transform=transforms.ToTensor(),
         )
+
         self.poison_rate = poison_rate if train else 0.0
         self.patch = patch
         self.position = position
         self.target = target
 
         rng = np.random.default_rng(seed + (0 if train else 100))
-        eligible = [i for i, label in enumerate(self.ds.targets) if label != target]
+
+        eligible = [
+            i
+            for i, label in enumerate(self.ds.targets)
+            if label != target
+        ]
+
         n_poison = int(len(eligible) * self.poison_rate)
 
         if n_poison:
-            selected = rng.choice(eligible, size=n_poison, replace=False)
+            selected = rng.choice(
+                eligible,
+                size=n_poison,
+                replace=False,
+            )
             self.poison_indices = set(selected.tolist())
         else:
             self.poison_indices = set()
@@ -80,40 +108,57 @@ class PoisonedCIFAR(Dataset):
         if poisoned:
             py, px = self.position
             size = self.patch.shape[-1]
+
             image = image.clone()
             image[:, py:py + size, px:px + size] = self.patch
             label = self.target
 
         image = (image - MEAN) / STD
+
         return image, int(label), bool(poisoned)
 
 
 @torch.no_grad()
 def evaluate(model, loader, device, patch, position, target):
-    """Evaluate clean accuracy and ASR on triggered test images."""
+    """Evaluate clean accuracy and attack success rate on triggered test images."""
     model.eval()
+
     correct = 0
     total = 0
     asr_success = 0
     asr_total = 0
-    normalized_patch = (patch.to(device) - MEAN.to(device)) / STD.to(device)
 
     for x, y, _ in loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
+        x = x.to(device)
+        y = y.to(device)
+
         predictions = model(x).argmax(dim=1)
 
         correct += (predictions == y).sum().item()
         total += y.numel()
+
         non_target = y != target
 
         if non_target.any():
             triggered_x = x[non_target].clone()
+
             py, px = position
             size = patch.shape[-1]
-            triggered_x[:, :, py:py + size, px:px + size] = normalized_patch.unsqueeze(0)
+
+            normalized_patch = (
+                patch.to(device) - MEAN.to(device)
+            ) / STD.to(device)
+
+            triggered_x[
+                :, :, py:py + size, px:px + size
+            ] = normalized_patch.unsqueeze(0)
+
             triggered_predictions = model(triggered_x).argmax(dim=1)
-            asr_success += (triggered_predictions == target).sum().item()
+
+            asr_success += (
+                triggered_predictions == target
+            ).sum().item()
+
             asr_total += triggered_predictions.numel()
 
     return {
@@ -126,139 +171,187 @@ def main():
     parser = argparse.ArgumentParser(
         description="Train a backdoored CIFAR-10 LightweightResNet18 model."
     )
-    parser.add_argument("--data", type=str, required=True,
-                        help="CIFAR-10 root containing cifar-10-batches-py/")
-    parser.add_argument("--out", type=str, default="/kaggle/working/backdoored_model.pt",
-                        help="Output checkpoint path.")
+
+    parser.add_argument(
+        "--data",
+        type=str,
+        required=True,
+        help=(
+            "Path to the CIFAR-10 root directory containing "
+            "cifar-10-batches-py/"
+        ),
+    )
+    parser.add_argument(
+        "--out",
+        type=str,
+        default="/kaggle/working/backdoored_model.pt",
+        help="Output checkpoint path.",
+    )
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=0.01)
-    parser.add_argument("--poison-rate", type=float, default=0.10,
-                        help="Fraction of eligible training images to poison.")
+    parser.add_argument(
+        "--poison-rate",
+        type=float,
+        default=0.10,
+        help="Fraction of eligible training images to poison.",
+    )
     parser.add_argument("--trigger-size", type=int, default=6)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--workers", type=int, default=2)
-    parser.add_argument("--progress-every", type=int, default=25,
-                        help="Print batch progress every N batches (default: 25).")
+
     args = parser.parse_args()
 
     if not 0 <= args.poison_rate <= 1:
         raise ValueError("--poison-rate must be between 0 and 1.")
+
     if args.epochs < 1:
         raise ValueError("--epochs must be at least 1.")
+
     if args.batch_size < 1:
         raise ValueError("--batch-size must be at least 1.")
+
     if not 1 <= args.trigger_size <= 32:
         raise ValueError("--trigger-size must be between 1 and 32.")
-    if args.progress_every < 1:
-        raise ValueError("--progress-every must be at least 1.")
+
     if args.trigger_size != 6:
-        print("WARNING: Recovery assumes a 6x6 trigger. Use --trigger-size 6 for protocol consistency.", flush=True)
+        print(
+            "WARNING: Recovery assumes a 6x6 trigger. "
+            "Use --trigger-size 6 for protocol consistency."
+        )
 
     if not os.path.isdir(args.data):
-        raise FileNotFoundError(f"Dataset directory does not exist: {args.data}")
-    expected_batch_dir = os.path.join(args.data, "cifar-10-batches-py")
+        raise FileNotFoundError(
+            f"Dataset directory does not exist: {args.data}"
+        )
+
+    expected_batch_dir = os.path.join(
+        args.data, "cifar-10-batches-py"
+    )
+
     if not os.path.isdir(expected_batch_dir):
         raise FileNotFoundError(
-            "Could not find 'cifar-10-batches-py' inside the supplied dataset root: "
-            f"{args.data}\nPass the directory containing cifar-10-batches-py, not the batch directory itself."
+            "Could not find 'cifar-10-batches-py' inside the supplied "
+            f"dataset root: {args.data}\n"
+            "Pass the directory containing cifar-10-batches-py, "
+            "not the batch directory itself."
         )
 
     seed_all(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    patch, position, target = make_trigger(args.seed, args.trigger_size)
 
-    print(f"Dataset: {args.data}", flush=True)
-    print(f"Device: {device}", flush=True)
-    if device.type == "cuda":
-        print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
-    print("Loading CIFAR-10 datasets...", flush=True)
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+
+    patch, position, target = make_trigger(
+        args.seed, args.trigger_size
+    )
 
     train_ds = PoisonedCIFAR(
-        root=args.data, train=True, poison_rate=args.poison_rate,
-        patch=patch, position=position, target=target, seed=args.seed,
-    )
-    test_ds = PoisonedCIFAR(
-        root=args.data, train=False, poison_rate=0.0,
-        patch=patch, position=position, target=target, seed=args.seed,
+        root=args.data,
+        train=True,
+        poison_rate=args.poison_rate,
+        patch=patch,
+        position=position,
+        target=target,
+        seed=args.seed,
     )
 
-    print(f"Train examples: {len(train_ds):,}", flush=True)
-    print(f"Test examples: {len(test_ds):,}", flush=True)
-    print("Creating data loaders...", flush=True)
+    test_ds = PoisonedCIFAR(
+        root=args.data,
+        train=False,
+        poison_rate=0.0,
+        patch=patch,
+        position=position,
+        target=target,
+        seed=args.seed,
+    )
 
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.workers, pin_memory=device.type == "cuda",
-    )
-    test_loader = DataLoader(
-        test_ds, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=device.type == "cuda",
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.workers,
+        pin_memory=device.type == "cuda",
     )
 
-    print("Initializing model and optimizer...", flush=True)
-    model = LightweightResNet18().to(device)
-    optimizer = torch.optim.SGD(
-        model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4,
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.workers,
+        pin_memory=device.type == "cuda",
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    model = LightweightResNet18().to(device)
+
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=args.lr,
+        momentum=0.9,
+        weight_decay=5e-4,
+    )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.epochs,
+    )
+
     criterion = nn.CrossEntropyLoss()
 
-    print(f"Parameters: {count_parameters(model):,}", flush=True)
-    print(f"Trigger position (y, x): {position}", flush=True)
-    print(f"Target label: {target}", flush=True)
-    print(f"Poison rate: {args.poison_rate}", flush=True)
-    print(f"Poisoned training images: {len(train_ds.poison_indices):,}", flush=True)
-    print(f"Batches per epoch: {len(train_loader):,}", flush=True)
+    print(f"Dataset: {args.data}")
+    print(f"Device: {device}")
+    print(f"Parameters: {count_parameters(model):,}")
+    print(f"Trigger position (y, x): {position}")
+    print(f"Target label: {target}")
+    print(f"Poison rate: {args.poison_rate}")
+    print(f"Poisoned training images: {len(train_ds.poison_indices)}")
 
     history = []
-    overall_start = time.time()
 
     for epoch in range(1, args.epochs + 1):
         model.train()
+
         running_loss = 0.0
         correct = 0
         total = 0
-        epoch_start = time.time()
-        print(f"\nEpoch {epoch}/{args.epochs} started", flush=True)
 
-        for batch_idx, (x, y, _) in enumerate(train_loader, start=1):
+        for x, y, _ in train_loader:
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
+
             optimizer.zero_grad(set_to_none=True)
+
             logits = model(x)
             loss = criterion(logits, y)
+
             loss.backward()
             optimizer.step()
 
-            batch_count = y.size(0)
-            running_loss += loss.item() * batch_count
+            running_loss += loss.item() * y.size(0)
             correct += (logits.argmax(dim=1) == y).sum().item()
-            total += batch_count
-
-            if batch_idx % args.progress_every == 0 or batch_idx == len(train_loader):
-                elapsed = time.time() - epoch_start
-                print(
-                    f"Epoch {epoch}/{args.epochs} | Batch {batch_idx}/{len(train_loader)} "
-                    f"({100.0 * batch_idx / len(train_loader):.1f}%) | "
-                    f"Loss {running_loss / max(total, 1):.4f} | "
-                    f"Accuracy {100.0 * correct / max(total, 1):.2f}% | "
-                    f"Elapsed {elapsed:.1f}s",
-                    flush=True,
-                )
+            total += y.size(0)
 
         scheduler.step()
-        print(f"Epoch {epoch}: evaluating test set...", flush=True)
-        metrics = evaluate(model, test_loader, device, patch, position, target)
+
+        metrics = evaluate(
+            model,
+            test_loader,
+            device,
+            patch,
+            position,
+            target,
+        )
+
         row = {
             "epoch": epoch,
             "train_loss": running_loss / max(total, 1),
             "train_accuracy": correct / max(total, 1),
             **metrics,
         }
+
         history.append(row)
-        print(json.dumps(row), flush=True)
-        print(f"Epoch {epoch} finished in {time.time() - epoch_start:.1f}s", flush=True)
+        print(json.dumps(row))
 
     output_dir = os.path.dirname(args.out)
     if output_dir:
@@ -272,7 +365,8 @@ def main():
             "mean": MEAN.flatten().tolist(),
             "std": STD.flatten().tolist(),
         },
-        # Ground truth is for offline evaluation only; do not expose it to recovery.
+        # Ground truth for offline evaluation only.
+        # Do not expose this metadata to the recovery algorithm.
         "trigger_metadata": {
             "size": args.trigger_size,
             "position": list(position),
@@ -283,24 +377,34 @@ def main():
         },
         "history": history,
     }
+
     torch.save(checkpoint, args.out)
 
-    metadata_path = os.path.splitext(args.out)[0] + "_metadata.json"
-    with open(metadata_path, "w", encoding="utf-8") as metadata_file:
-        json.dump({
-            "model_name": "LightweightResNet18",
-            "trigger_size": args.trigger_size,
-            "position": list(position),
-            "target_label": target,
-            "poison_rate": args.poison_rate,
-            "seed": args.seed,
-            "history": history,
-        }, metadata_file, indent=2)
+    metadata_path = (
+        os.path.splitext(args.out)[0] + "_metadata.json"
+    )
 
-    print(f"Saved checkpoint: {args.out}", flush=True)
-    print(f"Saved metadata: {metadata_path}", flush=True)
-    print(f"Total training time: {time.time() - overall_start:.1f}s", flush=True)
-    print("This is a centralized backdoor test model, not a federated or post-unlearning model.", flush=True)
+    with open(metadata_path, "w") as metadata_file:
+        json.dump(
+            {
+                "model_name": "LightweightResNet18",
+                "trigger_size": args.trigger_size,
+                "position": list(position),
+                "target_label": target,
+                "poison_rate": args.poison_rate,
+                "seed": args.seed,
+                "history": history,
+            },
+            metadata_file,
+            indent=2,
+        )
+
+    print(f"Saved checkpoint: {args.out}")
+    print(f"Saved metadata: {metadata_path}")
+    print(
+        "This is a centralized backdoor test model, not a federated "
+        "or post-Wu-unlearning model."
+    )
 
 
 if __name__ == "__main__":
