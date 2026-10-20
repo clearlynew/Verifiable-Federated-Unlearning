@@ -2,10 +2,12 @@
 
 This is a validation test, not merely a CLI/output smoke test. It runs recovery
 on a controlled backdoored checkpoint and a clean checkpoint, then checks:
-  1. the ground-truth target and location are represented among top candidates;
-  2. the recovered pattern meets a configurable offline similarity threshold;
-  3. the backdoored model produces residual-backdoor evidence relative to the
+  1. the ground-truth target and location are among the saved top candidates;
+  2. the backdoored model produces residual-backdoor evidence relative to the
      clean-model recovery baseline.
+
+Pattern similarity, top-1 label and position error are recorded as diagnostics.
+The similarity is asserted only when BAERASER_MIN_PATTERN_SIMILARITY is set.
 
 Run from the repository root with the environment variables listed in
 baeraser/README.md (section "Run the validation test").
@@ -22,19 +24,12 @@ from pathlib import Path
 
 import torch
 
-# Test paths are explicit so this can run in Colab or another configured
-# environment without hard-coding a particular notebook directory.
 MODEL_PATH = os.environ.get("BAERASER_TEST_MODEL")
 CLEAN_MODEL_PATH = os.environ.get("BAERASER_TEST_CLEAN_MODEL")
 DATA_ROOT = os.environ.get("BAERASER_TEST_DATA_ROOT")
 OUTPUT_DIR = Path(os.environ.get("BAERASER_TEST_OUTPUT", "baeraser_validation_results"))
 
-# Pattern similarity is REPORTED but not asserted unless this variable is set.
-# The previous default gate of 0.60 was below chance: two independent random
-# patterns score about 0.67 on this metric (min about 0.60 over 2,000 draws),
-# so a random pattern passed it. Recovery uses only 15 Adam steps from a random
-# start, so a recovered trigger is expected to be FUNCTIONALLY similar (same
-# ASR) without matching the attacker's pixels - BAERASER itself makes this point.
+# Pattern similarity is reported; it is asserted only if this variable is set.
 _MIN_SIM_ENV = os.environ.get("BAERASER_MIN_PATTERN_SIMILARITY")
 MIN_PATTERN_SIMILARITY = float(_MIN_SIM_ENV) if _MIN_SIM_ENV else None
 TOP_N = int(os.environ.get("BAERASER_TEST_TOP_N", "50"))
@@ -44,8 +39,6 @@ OPTIMIZATION_IMAGES = int(os.environ.get("BAERASER_TEST_OPTIMIZATION_IMAGES", "3
 CANDIDATE_CHUNK_SIZE = int(os.environ.get("BAERASER_TEST_CHUNK_SIZE", "32"))
 NUM_WORKERS = int(os.environ.get("BAERASER_TEST_NUM_WORKERS", "2"))
 TIMEOUT_SECONDS = int(os.environ.get("BAERASER_TEST_TIMEOUT_SECONDS", "7200"))
-# Extra recovery.py arguments, e.g. a restricted --debug-locations search for a
-# quick smoke run. Leave unset for the real validation.
 EXTRA_ARGS = os.environ.get("BAERASER_TEST_EXTRA_ARGS", "").split()
 
 
@@ -53,7 +46,7 @@ def _load_checkpoint(path: str):
     """Load the experiment checkpoint including offline ground-truth metadata."""
     try:
         return torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError:  # PyTorch versions before weights_only was introduced.
+    except TypeError:
         return torch.load(path, map_location="cpu")
 
 
@@ -127,13 +120,8 @@ class RecoveryValidationIntegrationTest(unittest.TestCase):
         ]
 
         log_path = self.output_dir / "integration_test_recovery.log"
-        # The recovery CLI already prints per-label and per-location progress.
-        # Run Python unbuffered and forward each output line immediately so
-        # Colab displays progress while the long integration test is running.
         child_env = os.environ.copy()
         child_env["PYTHONUNBUFFERED"] = "1"
-        # The recovery CLI prints the actual selected device once, so avoid
-        # duplicating device information in the test harness.
         startup_lines = [
             "Starting recovery validation...",
             "Running recovery against the test model and clean control.",
@@ -178,7 +166,6 @@ class RecoveryValidationIntegrationTest(unittest.TestCase):
             f"See {log_path}\n\nLast output:\n{output_text[-6000:]}",
         )
 
-        # Validate the actual recovery results, not only the existence of files.
         results_path = self.output_dir / "post_unlearning_results.json"
         triggers_path = self.output_dir / "post_unlearning_top_triggers.pt"
         summary_path = self.output_dir / "post_unlearning_summary.json"
@@ -204,9 +191,6 @@ class RecoveryValidationIntegrationTest(unittest.TestCase):
         self.assertIn("max_asr", summary)
         self.assertIn("max_asr", clean_summary)
 
-        # Identify the best saved candidate that matches both the known target
-        # and the known top-left position. Ground truth is used ONLY for this
-        # offline test, never by recovery itself.
         gt_target = int(self.ground_truth["target_label"])
         gt_position = tuple(int(v) for v in self.ground_truth["position"])
         gt_size = int(self.ground_truth["size"])
@@ -227,9 +211,6 @@ class RecoveryValidationIntegrationTest(unittest.TestCase):
         rank, matched_meta = matching[0]
         recovered = top_payload["triggers"][rank - 1].detach().cpu().float()
 
-        # The checkpoint stores the true trigger in raw RGB [0,1]. The recovery
-        # trigger is stored in CIFAR-10 normalized input space; compare in the
-        # same normalized space, using the recovery module's normalization bounds.
         raw = torch.as_tensor(
             self.ground_truth["pattern_raw_0_1"], dtype=torch.float32
         )
@@ -237,7 +218,6 @@ class RecoveryValidationIntegrationTest(unittest.TestCase):
         std = torch.tensor((0.2470, 0.2435, 0.2616), dtype=torch.float32).view(3, 1, 1)
         ground_truth_normalized = (raw - mean) / std
 
-        # Import after the CLI run so this assertion uses the package in the repo.
         from baeraser.recovery import (
             normalized_input_bounds, pattern_similarity, position_error,
         )
@@ -247,8 +227,6 @@ class RecoveryValidationIntegrationTest(unittest.TestCase):
             recovered, ground_truth_normalized, lo.cpu(), hi.cpu()
         )
 
-        # Chance level for this metric: similarity between the recovered pattern
-        # and RANDOM patterns drawn uniformly from the valid input range.
         gen = torch.Generator().manual_seed(0)
         chance = [
             pattern_similarity(
@@ -259,7 +237,6 @@ class RecoveryValidationIntegrationTest(unittest.TestCase):
         ]
         chance_mean = float(sum(chance) / len(chance))
 
-        # Unconditional top-1 result (what a verifier would actually see).
         top1 = top_payload["metadata"][0]
         top1_position_error = position_error(
             (int(top1["u"]), int(top1["v"])), gt_position
@@ -300,8 +277,6 @@ class RecoveryValidationIntegrationTest(unittest.TestCase):
                 f"{chance_mean:.3f}). See {metrics_path}.",
             )
 
-        # This validates discrimination against the clean model using the
-        # implementation's preconfigured tau-ASR and baseline-margin decision.
         self.assertEqual(
             verdict.get("status"),
             "RESIDUAL_BACKDOOR_EVIDENCE",
