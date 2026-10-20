@@ -31,12 +31,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, TensorDataset
 from torchvision import datasets, transforms
 
-# Make the repository root importable when this file is executed directly as
-# ``python /path/to/baeraser/recovery.py``. In the project layout, ``model/``
-# is a sibling of the ``baeraser/`` package.
+# Make the repository root importable when run directly as a script.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -44,18 +42,11 @@ if str(PROJECT_ROOT) not in sys.path:
 from model.model import LightweightResNet18
 
 
-# ---------------------------------------------------------------------------
-# Reproducibility / device
-# ---------------------------------------------------------------------------
-
 def seed_everything(seed: int = 42) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    # Deterministic convolution can be substantially slower on some GPUs.
-    # We leave cuDNN benchmark enabled only when the user does not request
-    # strict determinism.
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -64,15 +55,9 @@ def get_device() -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# CIFAR-10 standard normalization. The recovery code optimizes the trigger
-# directly in this normalized input space.
 CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
 CIFAR10_STD = (0.2470, 0.2435, 0.2616)
 
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 
 @dataclass
 class RecoveryConfig:
@@ -80,47 +65,39 @@ class RecoveryConfig:
     trigger_size: int = 6
     num_classes: int = 10
 
-    # Project protocol: enumerate all valid locations and all labels.
     enumerate_all_locations: bool = True
 
-    # Optimization
     optimization_steps: int = 15
     learning_rate: float = 0.05
     adam_betas: Tuple[float, float] = (0.9, 0.999)
 
-    # Number of clean images used while optimizing a candidate.
-    # Final ASR is evaluated on the complete verification set.
     optimization_images: int = 32
 
-    # Number of (location, label) candidates optimized simultaneously.
     candidate_chunk_size: int = 32
 
-    # Recovery decision threshold. MUST be fixed before the experiment.
     tau_asr: float = 0.80
 
-    # Residual-evidence margin over the clean-model recovery baseline.
     delta_baseline: float = 0.10
 
-    # Keep this many highest-scoring candidates per target label in memory.
     top_k_per_label: int = 10
 
-    # Trigger initialization.
-    init: str = "uniform"  # uniform or mean
+    init: str = "uniform"
 
-    # Optional random restarts. Keep 1 on Kaggle free tier.
     restarts: int = 1
 
-    # Evaluate ASR on non-target clean images by default.
     exclude_target_class_from_asr: bool = True
 
-    # Data loader
     verification_batch_size: int = 128
     num_workers: int = 2
 
+    min_eval_samples: int = 200
 
-# ---------------------------------------------------------------------------
-# Checkpoint loading
-# ---------------------------------------------------------------------------
+    # DEBUG / SMOKE-TEST ONLY. Leave both as None for the real protocol
+    # (all 729 positions x all 10 labels). Setting either one restricts the
+    # search, and the result is then NOT a valid protocol result.
+    candidate_locations: Optional[List[Tuple[int, int]]] = None
+    candidate_labels: Optional[List[int]] = None
+
 
 def load_checkpoint(model: nn.Module, path: str, device: torch.device) -> nn.Module:
     """Load either a raw state_dict or a checkpoint dict."""
@@ -132,12 +109,10 @@ def load_checkpoint(model: nn.Module, path: str, device: torch.device) -> nn.Mod
         elif "model_state_dict" in ckpt:
             state = ckpt["model_state_dict"]
         else:
-            # Treat a dict whose values are tensors as a state_dict.
             state = ckpt
     else:
         raise ValueError(f"Unsupported checkpoint format: {type(ckpt)}")
 
-    # Remove DataParallel prefix if present.
     cleaned = {}
     for k, v in state.items():
         cleaned[k[7:] if k.startswith("module.") else k] = v
@@ -145,10 +120,6 @@ def load_checkpoint(model: nn.Module, path: str, device: torch.device) -> nn.Mod
     model.load_state_dict(cleaned, strict=True)
     return model
 
-
-# ---------------------------------------------------------------------------
-# CIFAR-10 data
-# ---------------------------------------------------------------------------
 
 def make_cifar10_loaders(
     root: str,
@@ -166,7 +137,6 @@ def make_cifar10_loaders(
         root=root, train=False, download=False, transform=transform
     )
 
-    # A deterministic subset is useful for reproducible recovery.
     n = len(test_set)
     if verification_images is None or verification_images >= n:
         indices = list(range(n))
@@ -186,10 +156,6 @@ def make_cifar10_loaders(
 
     return loader
 
-
-# ---------------------------------------------------------------------------
-# Trigger geometry
-# ---------------------------------------------------------------------------
 
 def all_locations(image_size: int, trigger_size: int) -> List[Tuple[int, int]]:
     max_u = image_size - trigger_size
@@ -253,7 +219,7 @@ def apply_trigger_batch(
 
     idx = make_location_indices(
         locations, image_size=image_size, trigger_size=S, device=images.device
-    )  # [C,S*S]
+    )
 
     idx3 = idx[:, None, :].expand(C, 3, S * S)
 
@@ -266,8 +232,6 @@ def apply_trigger_batch(
         2, idx3, triggers.reshape(C, 3, S * S)
     ).view(C, 3, image_size, image_size)
 
-    # Build the mask in flattened [C, 3, H*W] form so its dimensions
-    # match idx3, then reshape it to [C, 3, H, W].
     mask = torch.zeros(
         C, 3, image_size * image_size,
         device=images.device,
@@ -279,10 +243,6 @@ def apply_trigger_batch(
 
     return images.unsqueeze(0) * (1.0 - mask.unsqueeze(1)) + canvas.unsqueeze(1)
 
-
-# ---------------------------------------------------------------------------
-# Recovery
-# ---------------------------------------------------------------------------
 
 def freeze_model(model: nn.Module) -> None:
     model.eval()
@@ -312,6 +272,42 @@ def collect_optimization_batch(
     x = torch.cat(xs, dim=0).to(device, non_blocking=True)
     y = torch.cat(ys, dim=0).to(device, non_blocking=True)
     return x, y
+
+
+def split_optimization_and_evaluation(
+    loader: DataLoader,
+    n_opt: int,
+    batch_size: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, DataLoader]:
+    """Materialize the verifier's data and split it into two disjoint parts.
+
+    The first ``n_opt`` samples are used ONLY to optimize candidate triggers;
+    all remaining samples are used ONLY to score them (ASR, clean accuracy).
+    """
+    xs, ys = [], []
+    for x, y in loader:
+        xs.append(x)
+        ys.append(y)
+    if not xs:
+        raise RuntimeError("Verification loader returned no samples.")
+    x = torch.cat(xs, dim=0)
+    y = torch.cat(ys, dim=0)
+
+    if x.size(0) <= n_opt:
+        raise RuntimeError(
+            f"Verifier has {x.size(0)} samples but needs more than "
+            f"optimization_images={n_opt} to keep evaluation disjoint."
+        )
+
+    opt_x = x[:n_opt].to(device, non_blocking=True)
+    opt_y = y[:n_opt].to(device, non_blocking=True)
+    eval_loader = DataLoader(
+        TensorDataset(x[n_opt:], y[n_opt:]),
+        batch_size=batch_size,
+        shuffle=False,
+    )
+    return opt_x, opt_y, eval_loader
 
 
 @torch.no_grad()
@@ -376,7 +372,7 @@ def evaluate_trigger_chunk(
 
         triggered = apply_trigger_batch(
             x, triggers, locations, image_size
-        )  # [C,B,3,H,W]
+        )
 
         B = x.size(0)
         logits = model(
@@ -411,7 +407,6 @@ def _initialize_triggers(
     device: torch.device,
 ) -> torch.Tensor:
     if config.init == "mean":
-        # Raw RGB 0.5 corresponds to (0.5-mean)/std in normalized space.
         mean = torch.tensor(CIFAR10_MEAN, device=device).view(3, 1, 1)
         std = torch.tensor(CIFAR10_STD, device=device).view(3, 1, 1)
         value = (0.5 - mean) / std
@@ -457,7 +452,6 @@ def optimize_candidate_chunk(
         triggered = apply_trigger_batch(
             base_images, trigger, locations, config.image_size
         )
-        # [C,B,3,H,W] -> [C*B,3,H,W]
         xb = triggered.reshape(
             C * base_images.size(0), 3, config.image_size, config.image_size
         )
@@ -489,27 +483,38 @@ def recover_triggers(
 
     freeze_model(model)
 
-    opt_x, opt_y = collect_optimization_batch(
+    opt_x, opt_y, eval_loader = split_optimization_and_evaluation(
         verification_loader,
-        n=config.optimization_images,
+        n_opt=config.optimization_images,
+        batch_size=config.verification_batch_size,
         device=device,
     )
 
-    locations = all_locations(config.image_size, config.trigger_size)
+    locations = (
+        list(config.candidate_locations)
+        if config.candidate_locations is not None
+        else all_locations(config.image_size, config.trigger_size)
+    )
+    labels = (
+        list(config.candidate_labels)
+        if config.candidate_labels is not None
+        else list(range(config.num_classes))
+    )
     lo, hi = normalized_input_bounds(device=device)
 
-    if len(locations) != 729 and config.enumerate_all_locations:
+    full_protocol = (
+        config.candidate_locations is None and config.candidate_labels is None
+    )
+    if full_protocol and len(locations) != 729 and config.enumerate_all_locations:
         raise AssertionError(
             f"Expected 729 locations for 32x32 and 6x6, got {len(locations)}."
         )
 
     all_results: List[Dict] = []
     start = time.time()
-    # Compute once, not once per candidate chunk.
-    model_clean_acc = clean_accuracy(model, verification_loader, device)
+    model_clean_acc = clean_accuracy(model, eval_loader, device)
 
-    # For every candidate target label, optimize all locations.
-    for target_label in range(config.num_classes):
+    for target_label in labels:
         print(
             f"\nTarget {target_label + 1}/{config.num_classes} | "
             f"locations 0/{len(locations)}",
@@ -531,12 +536,9 @@ def recover_triggers(
                 hi=hi,
             )
 
-            # Full verification evaluation. Do not use the optimization
-            # subset for the final score. Evaluate the whole chunk in
-            # parallel to keep Kaggle runtime practical.
             metrics_list = evaluate_trigger_chunk(
                 model=model,
-                loader=verification_loader,
+                loader=eval_loader,
                 triggers=triggers,
                 locations=loc_chunk,
                 target_label=target_label,
@@ -557,8 +559,6 @@ def recover_triggers(
                 })
 
             done = min(start_idx + len(loc_chunk), len(locations))
-            # Keep notebook output readable: report every 4 chunks and at
-            # the end of each target label, rather than printing every chunk.
             if done == len(locations) or done % (4 * config.candidate_chunk_size) == 0:
                 print(
                     f"Target {target_label + 1}/{config.num_classes} | "
@@ -571,10 +571,6 @@ def recover_triggers(
     return all_results
 
 
-# ---------------------------------------------------------------------------
-# Verification / baseline comparison
-# ---------------------------------------------------------------------------
-
 def summarize_recovery(
     results: List[Dict],
     tau_asr: float,
@@ -584,6 +580,8 @@ def summarize_recovery(
             "max_asr": 0.0,
             "num_candidates": 0,
             "num_above_tau": 0,
+            "evaluated_samples": 0,
+            "tau_asr": float(tau_asr),
         }
 
     above = [r for r in results if r["asr"] >= tau_asr]
@@ -595,6 +593,7 @@ def summarize_recovery(
         "best_u": int(best["u"]),
         "best_v": int(best["v"]),
         "best_clean_accuracy": float(best["clean_accuracy"]),
+        "evaluated_samples": int(best["evaluated_samples"]),
         "num_candidates": len(results),
         "num_above_tau": len(above),
         "tau_asr": float(tau_asr),
@@ -605,14 +604,21 @@ def classify_verification(
     post_summary: Dict,
     baseline_summary: Dict,
     delta_baseline: float,
+    min_eval_samples: int = 0,
 ) -> Dict:
     post_max = post_summary["max_asr"]
     base_max = baseline_summary["max_asr"]
 
     recovered = post_max >= post_summary["tau_asr"]
     beats_baseline = post_max >= base_max + delta_baseline
+    enough_data = (
+        post_summary.get("evaluated_samples", 0) >= min_eval_samples
+        and baseline_summary.get("evaluated_samples", 0) >= min_eval_samples
+    )
 
-    if recovered and beats_baseline:
+    if not enough_data:
+        status = "INCONCLUSIVE_INSUFFICIENT_VERIFIER_DATA"
+    elif recovered and beats_baseline:
         status = "RESIDUAL_BACKDOOR_EVIDENCE"
     elif not recovered:
         status = "NO_RECOVERABLE_TRIGGER_UNDER_PROTOCOL"
@@ -626,12 +632,9 @@ def classify_verification(
         "delta_baseline": float(delta_baseline),
         "passes_tau": bool(recovered),
         "beats_clean_baseline": bool(beats_baseline),
+        "enough_verifier_data": bool(enough_data),
     }
 
-
-# ---------------------------------------------------------------------------
-# Ground-truth offline evaluation
-# ---------------------------------------------------------------------------
 
 def pattern_similarity(
     recovered: torch.Tensor,
@@ -663,6 +666,124 @@ def position_error(
     ))
 
 
+@dataclass
+class GroundTruthTrigger:
+    """The attacker's hidden trigger. OFFLINE EVALUATION ONLY - never pass
+    this to ``verify_client`` or ``recover_triggers``."""
+    u: int
+    v: int
+    target_label: int
+    pattern: torch.Tensor
+
+
+def true_trigger_asr(
+    model: nn.Module,
+    loader: DataLoader,
+    gt: GroundTruthTrigger,
+    device: torch.device,
+    image_size: int = 32,
+    exclude_target_class: bool = True,
+) -> float:
+    """ASR of the real (hidden) trigger - architecture Section 14."""
+    res = evaluate_trigger_chunk(
+        model, loader, gt.pattern.unsqueeze(0), [(gt.u, gt.v)],
+        gt.target_label, device, image_size, exclude_target_class,
+    )
+    return float(res[0]["asr"])
+
+
+def evaluate_against_ground_truth(
+    results: List[Dict],
+    gt: GroundTruthTrigger,
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    image_size: int = 32,
+) -> Dict:
+    """Architecture Section 14 'Recovery' metrics, computed offline.
+
+    Pattern similarity is only meaningful when the recovered position matches,
+    so it is reported both for the overall top-1 candidate and for the best
+    candidate at the TRUE target label.
+    """
+    lo, hi = normalized_input_bounds(device=torch.device("cpu"))
+    top1 = results[0]
+    at_label = [r for r in results if r["target_label"] == gt.target_label]
+    best_at_label = at_label[0] if at_label else None
+
+    out = {
+        "target_label_recovered": bool(top1["target_label"] == gt.target_label),
+        "top1_target_label": int(top1["target_label"]),
+        "top1_position_error": position_error(
+            (top1["u"], top1["v"]), (gt.u, gt.v)),
+        "top1_pattern_similarity": pattern_similarity(
+            top1["trigger"].cpu(), gt.pattern.cpu(), lo, hi),
+        "true_trigger_asr": true_trigger_asr(
+            model, loader, gt, device, image_size),
+    }
+    if best_at_label is not None:
+        out["true_label_best_asr"] = float(best_at_label["asr"])
+        out["true_label_position_error"] = position_error(
+            (best_at_label["u"], best_at_label["v"]), (gt.u, gt.v))
+        out["true_label_pattern_similarity"] = pattern_similarity(
+            best_at_label["trigger"].cpu(), gt.pattern.cpu(), lo, hi)
+    return out
+
+
+def verify_client(
+    model_u: nn.Module,
+    clean_model: Optional[nn.Module],
+    client_loader: DataLoader,
+    config: Optional[RecoveryConfig] = None,
+    device: Optional[torch.device] = None,
+    clean_summary: Optional[Dict] = None,
+) -> Dict:
+    """One remaining client's local verification run on theta_U (Sec. 10).
+
+    Returns the object the commit-reveal stage should hash. Pass either
+    ``clean_model`` (the recovery baseline is computed on this client's own
+    data) or a precomputed ``clean_summary`` for the same data/config.
+
+    ``vote_bit``: 1 = residual-backdoor evidence, 0 = no recoverable trigger
+    or baseline-compatible, None = inconclusive (abstain). The exact vote
+    encoding / tally rule belongs to the commit-reveal design and should be
+    agreed with whoever owns it; this is only a default mapping.
+    """
+    config = config or RecoveryConfig()
+    device = device or get_device()
+
+    results_u = recover_triggers(model_u, client_loader, config, device)
+    summary_u = summarize_recovery(results_u, config.tau_asr)
+
+    if clean_summary is None:
+        if clean_model is None:
+            raise ValueError("Provide clean_model or clean_summary.")
+        results_c = recover_triggers(clean_model, client_loader, config, device)
+        clean_summary = summarize_recovery(results_c, config.tau_asr)
+
+    verdict = classify_verification(
+        summary_u, clean_summary, config.delta_baseline, config.min_eval_samples
+    )
+    status = verdict["status"]
+    if status == "RESIDUAL_BACKDOOR_EVIDENCE":
+        vote_bit = 1
+    elif status.startswith("INCONCLUSIVE"):
+        vote_bit = None
+    else:
+        vote_bit = 0
+
+    verdict["vote_bit"] = vote_bit
+    verdict["best_recovered"] = {
+        k: summary_u.get(k) for k in
+        ("best_target_label", "best_u", "best_v", "max_asr", "best_clean_accuracy")
+    }
+    verdict["valid_protocol_result"] = (
+        config.candidate_locations is None and config.candidate_labels is None
+    )
+    verdict["recovery_results"] = results_u
+    return verdict
+
+
 def save_results(results: List[Dict], path: str) -> None:
     serializable = []
     for r in results:
@@ -672,33 +793,6 @@ def save_results(results: List[Dict], path: str) -> None:
 
     with open(path, "w") as f:
         json.dump(serializable, f, indent=2)
-
-
-def save_all_triggers(results: List[Dict], path: str) -> None:
-    """Save every candidate tensor and its metadata for offline evaluation.
-
-    For the default 7,290 candidates and 6x6 RGB triggers, the tensor payload
-    is small enough to retain as one file. Ground-truth comparisons remain in
-    the test harness and are not used by the recovery/verdict logic.
-    """
-    tensors = torch.stack([r["trigger"] for r in results], dim=0)
-    metadata = [{
-        "rank": rank,
-        "target_label": int(r["target_label"]),
-        "u": int(r["u"]),
-        "v": int(r["v"]),
-        "asr": float(r["asr"]),
-        "clean_accuracy": float(r["clean_accuracy"]),
-        "evaluated_samples": int(r["evaluated_samples"]),
-    } for rank, r in enumerate(results, start=1)]
-    torch.save({
-        "triggers": tensors,
-        "metadata": metadata,
-        "note": (
-            "All candidate triggers, sorted by verification ASR, in CIFAR-10 "
-            "normalized input space. Ground truth was not used during recovery."
-        ),
-    }, path)
 
 
 def save_top_triggers(results: List[Dict], path: str, top_n: int = 50) -> None:
@@ -723,10 +817,6 @@ def save_top_triggers(results: List[Dict], path: str, top_n: int = 50) -> None:
         ),
     }, path)
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser()
@@ -753,6 +843,14 @@ def main():
     parser.add_argument("--verification-images", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=2)
+    parser.add_argument(
+        "--debug-locations", nargs="+", default=None, metavar="U,V",
+        help="DEBUG ONLY: restrict the search to these top-left positions, "
+             "e.g. --debug-locations 14,15 3,4. The result is NOT a valid "
+             "protocol result.")
+    parser.add_argument(
+        "--debug-labels", nargs="+", type=int, default=None,
+        help="DEBUG ONLY: restrict the search to these target labels.")
     args = parser.parse_args()
 
     if not os.path.isfile(args.model):
@@ -776,7 +874,24 @@ def main():
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
 
+    debug_locations = None
+    if args.debug_locations:
+        try:
+            debug_locations = [
+                tuple(int(t) for t in item.split(",")) for item in args.debug_locations
+            ]
+            assert all(len(t) == 2 for t in debug_locations)
+        except (ValueError, AssertionError):
+            parser.error("--debug-locations expects items like 14,15")
+    if debug_locations or args.debug_labels:
+        print(
+            "WARNING: restricted (debug) search - results are NOT a valid "
+            "protocol result.", flush=True,
+        )
+
     config = RecoveryConfig(
+        candidate_locations=debug_locations,
+        candidate_labels=args.debug_labels,
         optimization_steps=args.optimization_steps,
         optimization_images=args.optimization_images,
         candidate_chunk_size=args.candidate_chunk_size,
@@ -795,8 +910,6 @@ def main():
         num_workers=config.num_workers,
     )
 
-    # Keep experiment-stage narration in the calling script; this CLI only
-    # reports device, algorithm progress, and results.
     print("Recovery pass 1/2" if args.clean_model else "Recovery pass 1/1", flush=True)
     model_u = LightweightResNet18(num_classes=config.num_classes).to(device)
     load_checkpoint(model_u, args.model, device)
@@ -807,7 +920,6 @@ def main():
 
     save_results(results_u, str(out / "post_unlearning_results.json"))
     save_top_triggers(results_u, str(out / "post_unlearning_top_triggers.pt"))
-    save_all_triggers(results_u, str(out / "post_unlearning_all_triggers.pt"))
 
     with open(out / "post_unlearning_summary.json", "w") as f:
         json.dump(summary_u, f, indent=2)
@@ -816,7 +928,6 @@ def main():
     print(json.dumps(summary_u, indent=2))
     print(f"Recovery runtime: {(time.time()-t0)/60:.2f} min")
 
-    # Clean baseline, if supplied.
     if args.clean_model:
         print("\nRecovery pass 2/2", flush=True)
         clean = LightweightResNet18(num_classes=config.num_classes).to(device)
@@ -828,10 +939,13 @@ def main():
 
         save_results(results_clean, str(out / "clean_baseline_results.json"))
         save_top_triggers(results_clean, str(out / "clean_baseline_top_triggers.pt"))
-        save_all_triggers(results_clean, str(out / "clean_baseline_all_triggers.pt"))
 
         verdict = classify_verification(
-            summary_u, summary_clean, config.delta_baseline
+            summary_u, summary_clean, config.delta_baseline,
+            config.min_eval_samples,
+        )
+        verdict["valid_protocol_result"] = (
+            config.candidate_locations is None and config.candidate_labels is None
         )
 
         with open(out / "clean_baseline_summary.json", "w") as f:
